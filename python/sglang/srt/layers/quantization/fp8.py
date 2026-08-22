@@ -1965,6 +1965,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_s = _convert_ue8m0_scales_for_deepgemm(
                     layer.w2_weight_scale_inv.data, layer.w2_weight.data.shape
                 )
+            elif get_moe_runner_backend().is_cutlass():
+                # Without this branch cutlass fell through to the triton swizzle below and got a
+                # 5-D matmul-blocked scale, failing the expert-count assert in cutlass_moe.py.
+                # The ES mm kernel reads scale factors per expert in CUTLASS's 128x4 interleaved
+                # blockscale order (es_sm100_mxfp8_blockscaled_group_quant.cuh:25), NOT row-major
+                # as the checkpoint stores them, so re-order here. Same permutation as
+                # swizzle_blockscale() in ../utils.py, minus its fp8-only dtype assert; no padding
+                # is needed because the ES kernel already requires k % 128 == 0, which makes the
+                # scale's K (= k/32) a multiple of 4 and its M a multiple of 128.
+                def _swizzle_es_blockscale(scale: torch.Tensor) -> torch.Tensor:
+                    e, m, k = scale.shape
+                    assert m % 128 == 0 and k % 4 == 0, f"unaligned mxfp8 scale {(e, m, k)}"
+                    return (
+                        scale.reshape(e, m // 128, 4, 32, k // 4, 4)
+                        .permute(0, 1, 4, 3, 2, 5)
+                        .contiguous()
+                        .reshape(e, m, k)
+                    )
+
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = _swizzle_es_blockscale(layer.w13_weight_scale_inv.data)
+                w2_s = _swizzle_es_blockscale(layer.w2_weight_scale_inv.data)
             else:
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data

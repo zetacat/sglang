@@ -6857,15 +6857,19 @@ class ServerArgs:
         # invoked here at the legacy write slots.
         run_post_process_pass(self, _moe_runner_fusion_disable)
 
-        if resolved_view(self).moe_runner_backend == "cutlass" and resolved_view(
-            self
-        ).quantization in [
-            "fp8",
-            "mxfp8",
-        ]:
+        if resolved_view(self).moe_runner_backend == "cutlass":
+            # MXFP8 cutlass MoE supports expert parallelism: StandardDispatcher hands it local
+            # expert ids (-1 for non-local) and cutlass_fused_experts_fp8 masks those rows out.
+            # FP8 shares that path but is unvalidated at ep_size > 1, so it stays restricted.
+            if resolved_view(self).quantization == "fp8":
+                assert (
+                    resolved_view(self).ep_size == 1
+                ), "FP8 Cutlass MoE is only supported with ep_size == 1"
+            # Only StandardDispatcher produces the topk_output / local-id contract this backend
+            # reads; the a2a dispatchers return a different struct and fail inside the forward.
             assert (
-                resolved_view(self).ep_size == 1
-            ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+                resolved_view(self).moe_a2a_backend == "none"
+            ), "Cutlass MoE requires --moe-a2a-backend none"
 
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL

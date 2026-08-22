@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 _is_cuda = is_cuda()
@@ -119,8 +120,15 @@ def cutlass_fused_experts_fp8(
     assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
-    assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
-    assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
+    assert w1_q.shape[0] == w1_scale.shape[0], (
+        f"w1 scales expert number mismatch: w1_q={tuple(w1_q.shape)} "
+        f"w1_scale={tuple(w1_scale.shape)} w2_q={tuple(w2_q.shape)} "
+        f"w2_scale={tuple(w2_scale.shape)}"
+    )
+    assert w1_q.shape[0] == w2_scale.shape[0], (
+        f"w2 scales expert number mismatch: w1_q={tuple(w1_q.shape)} "
+        f"w2_scale={tuple(w2_scale.shape)}"
+    )
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
     if is_cuda:
@@ -137,8 +145,29 @@ def cutlass_fused_experts_fp8(
     topk = topk_ids.size(1)
     device = a.device
 
+    ep_enabled = get_parallel().moe_ep_size > 1
+
+    # dp-attention + EP give some ranks zero tokens. prepare_moe_input would then launch with
+    # num_threads == 0 (invalid config) and apply_shuffle_mul_sum divides by m.
+    if m == 0 or topk_ids.numel() == 0:
+        return (
+            output
+            if output is not None
+            else torch.empty((m, k), device=device, dtype=out_dtype)
+        )
+
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    if ep_enabled:
+        # StandardDispatcher marks experts owned by other ranks with -1. prepare_moe_input matches
+        # expert ids by equality, so those entries are excluded from expert_offsets / problem_sizes
+        # and never reach the grouped GEMMs -- but they also leave their a_map / c_map slots
+        # unwritten, and shuffle_rows / apply_shuffle_mul_sum dereference them with no bounds check
+        # (the load happens before the weight multiply, so a zero weight alone is not enough).
+        # Point both at row 0 and zero the routing weight so the row contributes nothing.
+        a_map.zero_()
+        c_map.zero_()
+        topk_weights = torch.where(topk_ids >= 0, topk_weights, 0.0)
 
     if use_mxfp8:
         assert es_up and es_down, "MXFP8 requires expert-specialization for both GEMMs"
@@ -212,6 +241,12 @@ def cutlass_fused_experts_fp8(
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
+    if ep_enabled:
+        # Non-local rows land on c2[0] (see c_map above) with weight 0, but the grouped GEMM only
+        # writes c2[0] when at least one token matched a local expert -- otherwise it stays
+        # uninitialized and 0 * NaN = NaN would poison the all-reduce. Zeroing one row is enough;
+        # the GEMM overwrites it whenever it is real output.
+        c2[0].zero_()
 
     a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
     w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
